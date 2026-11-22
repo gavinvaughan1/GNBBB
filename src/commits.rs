@@ -20,9 +20,47 @@ use std::path::{Path, PathBuf};
 const ID_KEYS: [&str; 8] = ["sha", "hash", "commit_hash", "commit_sha", "oid", "id", "commit", "revision"];
 const MSG_KEYS: [&str; 5] = ["subject", "message", "msg", "title", "summary"];
 
+#[derive(Default)]
 pub struct Commit {
     pub id: String,
     pub subject: String,
+    /// Field name the input used for the id (reused in the output; default "sha").
+    pub id_key: &'static str,
+}
+
+fn c(id: String, subject: String) -> Commit {
+    Commit { id, subject, ..Default::default() }
+}
+
+fn json_esc(o: &mut String, s: &str) {
+    o.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+}
+
+/// One commit as a single-line JSON object.
+pub fn to_json(c: &Commit) -> String {
+    let mut o = String::with_capacity(c.id.len() + c.subject.len() + 32);
+    o.push('{');
+    json_esc(&mut o, if c.id_key.is_empty() { "sha" } else { c.id_key });
+    o.push(':');
+    json_esc(&mut o, &c.id);
+    o.push(',');
+    json_esc(&mut o, "subject");
+    o.push(':');
+    json_esc(&mut o, &c.subject);
+    o.push('}');
+    o
 }
 
 /// Runs commits mode if the commits directory exists. Returns false otherwise.
@@ -34,13 +72,10 @@ pub fn run_if_present(data: &str, out: &str) -> bool {
     let commits = collect(&dir);
     let mut text = String::with_capacity(commits.len() * 64);
     for c in &commits {
-        text.push_str(&c.id);
-        if !c.subject.is_empty() {
-            text.push(' ');
-            text.push_str(&c.subject);
-        }
+        text.push_str(&to_json(c));
         text.push('\n');
     }
+    eprintln!("[commits] {} commits from {}", commits.len(), dir.display());
     let so = std::io::stdout();
     let mut so = so.lock();
     let _ = so.write_all(text.as_bytes());
@@ -126,14 +161,14 @@ pub fn parse_file(s: &str, name: &str) -> Vec<Commit> {
             .iter()
             .map(|l| {
                 let id = leading_hex(l).unwrap();
-                Commit { id: id.to_string(), subject: one_line(l[id.len()..].trim()) }
+                c(id.to_string(), one_line(l[id.len()..].trim()))
             })
             .collect();
     }
     // Single commit per file.
     let id = find_labeled_hex(t).or_else(|| file_stem_hex(name)).or_else(|| first_hex(t)).unwrap_or_default();
     let subject = nonempty.iter().find(|l| !l.contains(id.as_str()) || id.is_empty()).map(|l| one_line(l)).unwrap_or_default();
-    vec![Commit { id, subject }]
+    vec![c(id, subject)]
 }
 
 // ---------- helpers: hex ids ----------
@@ -188,7 +223,7 @@ fn split_git_log(lines: &[&str]) -> Vec<Commit> {
     let mut in_msg = false;
     for l in lines {
         if let Some(id) = git_log_header(l) {
-            v.push(Commit { id: id.to_string(), subject: String::new() });
+            v.push(c(id.to_string(), String::new()));
             in_msg = false;
             continue;
         }
@@ -214,7 +249,7 @@ fn split_mbox(lines: &[&str]) -> Vec<Commit> {
     let mut v: Vec<Commit> = Vec::new();
     for l in lines {
         if let Some(id) = mbox_header(l) {
-            v.push(Commit { id: id.to_string(), subject: String::new() });
+            v.push(c(id.to_string(), String::new()));
             continue;
         }
         if let Some(c) = v.last_mut() {
@@ -286,18 +321,18 @@ fn parse_csv(s: &str, sep: u8) -> Option<Vec<Commit>> {
     let rows = csv_rows(s, sep);
     let hdr: Vec<String> = rows.first()?.iter().map(|h| h.trim().to_ascii_lowercase()).collect();
     let has_header = !hdr.iter().any(|h| is_hex_id(h));
-    let idc = if has_header { ID_KEYS.iter().find_map(|k| hdr.iter().position(|h| h == k)) } else { None };
+    let idc = if has_header { ID_KEYS.iter().find_map(|k| hdr.iter().position(|h| h == k).map(|i| (i, *k))) } else { None };
     let msgc = if has_header { MSG_KEYS.iter().find_map(|k| hdr.iter().position(|h| h == k)) } else { None };
     let body = if has_header { &rows[1..] } else { &rows[..] };
     Some(
         body.iter()
             .map(|r| {
                 let id = match idc {
-                    Some(i) => r.get(i).map(|x| x.trim().to_string()).unwrap_or_default(),
+                    Some((i, _)) => r.get(i).map(|x| x.trim().to_string()).unwrap_or_default(),
                     None => r.iter().find(|f| is_hex_id(f.trim())).map(|f| f.trim().to_string()).unwrap_or_default(),
                 };
                 let subject = msgc.and_then(|i| r.get(i)).map(|m| one_line(m)).unwrap_or_default();
-                Commit { id, subject }
+                Commit { id, subject, id_key: idc.map_or("", |x| x.1) }
             })
             .collect(),
     )
@@ -433,11 +468,13 @@ fn commit_from_obj(b: &[u8], span: (usize, usize)) -> Commit {
     let f = obj_fields(b, span.0, span.1);
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
     let mut id = String::new();
+    let mut id_key = "";
     for k in ID_KEYS {
         if let Some(v) = get(k) {
             if let Some(s) = json_str(b, v) {
                 if !s.is_empty() && s != "null" {
                     id = s;
+                    id_key = k;
                     break;
                 }
             }
@@ -456,6 +493,7 @@ fn commit_from_obj(b: &[u8], span: (usize, usize)) -> Commit {
             let inner = commit_from_obj(b, v);
             if id.is_empty() {
                 id = inner.id;
+                id_key = inner.id_key;
             }
             if subject.is_empty() {
                 subject = inner.subject;
@@ -465,7 +503,7 @@ fn commit_from_obj(b: &[u8], span: (usize, usize)) -> Commit {
     if id.is_empty() {
         id = first_hex(&String::from_utf8_lossy(&b[span.0..span.1])).unwrap_or_default();
     }
-    Commit { id, subject }
+    Commit { id, subject, id_key }
 }
 
 fn records_from_value(b: &[u8], span: (usize, usize), out: &mut Vec<Commit>) {
@@ -485,7 +523,7 @@ fn records_from_value(b: &[u8], span: (usize, usize), out: &mut Vec<Commit>) {
         }
         _ => {
             if let Some(s) = json_str(b, span) {
-                out.push(Commit { id: s.trim().to_string(), subject: String::new() });
+                out.push(c(s.trim().to_string(), String::new()));
             }
         }
     }
