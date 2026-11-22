@@ -1,4 +1,5 @@
 #![allow(unused_assignments, dead_code, unused_imports, unused_unsafe, unused_mut, unused_variables, unsafe_op_in_unsafe_fn, unexpected_cfgs, static_mut_refs)]
+mod commits;
 mod keys;
 mod pqw;
 
@@ -1062,6 +1063,11 @@ fn dsb_line(bin: &str, t: &Topo) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     child_mode(&args);
+    {
+        let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
+        let out = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
+        if commits::run_if_present(&data, &out) { unsafe { _exit(0) } }
+    }
     START.store(now(), Relaxed);
     REAL0.store(clk_ns(0) as u64, Relaxed);
     BOOT0.store(clk_ns(7) as u64, Relaxed);
